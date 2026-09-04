@@ -1,0 +1,27 @@
+---
+# Pre-pulls the box image into an ECI image cache (a disk snapshot), so a
+# serverless box boots from the snapshot instead of pulling 1.4 GB.
+#
+# Measured without it: 2m20s of image pull before the box even starts, which is
+# why the client's first connection attempt after provisioning always failed and
+# only a later retry succeeded. With a matching cache, ECI attaches the snapshot
+# and the box is ready in seconds.
+#
+# Cluster-scoped, and matched to Pods automatically by image list — the box Pod
+# template carries `k8s.aliyun.com/eci-image-cache: "true"` to opt in.
+#
+#   kubectl apply -f deploy/acs/image-cache.yaml
+#   kubectl get imagecache grok-bot-box -w      # wait for phase Ready
+apiVersion: eci.alibabacloud.com/v1
+kind: ImageCache
+metadata:
+  name: grok-bot-box
+spec:
+  images:
+    # Keep in sync with DEFAULT_BOX_IMAGE in source/broker/main.ts. The tag is
+    # mutable upstream, so a rebuilt cache can differ from an older one; delete
+    # and recreate this object to refresh it.
+    - public.ecr.aws/k0i0n2g5/cursorenvironments/universal:sand-box-latest
+  # The image is ~1.4 GB; the cache disk needs room for it plus overhead.
+  imageCacheSize: 20
+  retentionDays: 30

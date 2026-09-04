@@ -1,0 +1,169 @@
+---
+# The self-hosted broker: it provisions one box Pod per API key and reverse-proxies
+# that box's gateway and desktop back to the client. With it, a packaged app needs
+# nothing but this URL and a key — no kubeconfig, no port-forwarding, no shared
+# credential.
+#
+# Apply after seeding the bundle:
+#   node scripts/build-broker.mjs && ./deploy/acs/seed-runtime.sh
+#   kubectl -n grok-bot create secret generic grok-bot-broker-keys \
+#     --from-literal=master="$(python3 -c 'import secrets;print(secrets.token_urlsafe(48))')"
+#   kubectl apply -f deploy/acs/broker.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grok-bot-broker
+  namespace: grok-bot
+---
+# Exactly the verbs the provisioner and the allowlist use. No secrets access: the
+# master key arrives as a mounted volume, so a compromised broker cannot read
+# other secrets in the namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grok-bot-broker
+  namespace: grok-bot
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grok-bot-broker
+  namespace: grok-bot
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: grok-bot-broker }
+subjects:
+  - { kind: ServiceAccount, name: grok-bot-broker, namespace: grok-bot }
+---
+# Who may provision a box: sha256(apiKey) -> display name. The plaintext key only
+# ever exists in the user's app, so this list cannot be replayed as a credential.
+# Mint one with: scripts/mint-broker-key.mjs
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grok-bot-api-keys
+  namespace: grok-bot
+data: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grok-bot-broker
+  namespace: grok-bot
+spec:
+  # Single replica on purpose: create-or-adopt is serialised in-process, and the
+  # router's activity bookkeeping lives in memory.
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: grok-bot-broker }
+  template:
+    metadata:
+      labels: { app: grok-bot-broker }
+    spec:
+      serviceAccountName: grok-bot-broker
+      # The image is only a Node runtime here; the broker itself is the seeded
+      # bundle. Same image as the boxes, so it is already cached on the nodes.
+      containers:
+        - name: broker
+          image: public.ecr.aws/k0i0n2g5/cursorenvironments/universal:sand-box-latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/bin/node", "/opt/broker/broker.cjs"]
+          env:
+            - { name: BROKER_PORT, value: "8080" }
+            - { name: BOX_NAMESPACE, value: grok-bot }
+            - { name: BROKER_MASTER_SECRET_FILE, value: /etc/broker/master }
+            - { name: BROKER_RUNTIME_DIR, value: /opt/runtime-payload }
+            # Reached by the client; see deploy/acs/README.md on why this is HTTP
+            # for now and what has to change before wider distribution.
+            - { name: PUBLIC_BASE_URL, value: "http://alb-jpofuvio0969xihycr.cn-hongkong.alb.aliyuncsslbintl.com" }
+            - { name: BOX_RUNTIME_BASE_URL, value: "http://grok-bot-broker.grok-bot.svc.cluster.local/runtime" }
+            # A cold serverless start measured 2m20s for the 1.4GB image pull
+            # alone, so the readiness budget has to clear that plus the box's boot.
+            - { name: BOX_READY_TIMEOUT_MS, value: "420000" }
+            - { name: MAX_LIVE_BOXES, value: "5" }
+            # Every box gets this inference endpoint, so a user needs only their
+            # broker key. It must be reachable *from the cluster*: the box runs the
+            # agent loop, and api-gateway.glm.ai does not resolve in here.
+            - { name: BOX_INFERENCE_API_KEY_FILE, value: /etc/broker/inference-key }
+            - { name: BOX_INFERENCE_BASE_URL, value: "https://open.bigmodel.cn/api/anthropic" }
+            - { name: BOX_INFERENCE_MODEL, value: glm-5.3 }
+            - { name: IDLE_TTL_MS, value: "7200000" }
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          # Deliberately tiny: the broker shuffles bytes and calls the apiserver.
+          # It also has to schedule onto the one node this ReadWriteOnce disk is
+          # bound to, and that node had 90m of 7910m allocatable CPU left when this
+          # was written — hence a 50m floor with room to burst to 2 CPU.
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { cpu: "2", memory: 1Gi }
+          volumeMounts:
+            - { name: broker-code, mountPath: /opt/broker/broker.cjs, subPath: broker/broker.cjs, readOnly: true }
+            - { name: broker-code, mountPath: /opt/runtime-payload, subPath: runtime-payload, readOnly: true }
+            - { name: master, mountPath: /etc/broker/master, subPath: master, readOnly: true }
+            - { name: inference, mountPath: /etc/broker/inference-key, subPath: bigmodel-key, readOnly: true }
+      volumes:
+        # ReadWriteOnce is fine for one pod; the boxes deliberately do NOT mount
+        # this disk (they fetch the runtime over HTTP instead).
+        - name: broker-code
+          persistentVolumeClaim: { claimName: grok-bot-runtime, readOnly: true }
+        - name: master
+          secret: { secretName: grok-bot-broker-keys, items: [{ key: master, path: master }] }
+        # The operator's model credential, handed to each box. Already in the
+        # cluster for the older single-box deployment.
+        - name: inference
+          secret: { secretName: grok-bot-inference, items: [{ key: bigmodel-key, path: bigmodel-key }] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grok-bot-broker
+  namespace: grok-bot
+spec:
+  type: ClusterIP
+  selector: { app: grok-bot-broker }
+  ports:
+    - { name: http, port: 80, targetPort: 8080 }
+---
+# Path rules only, no host: the ALB is shared with other teams' workloads and we
+# cannot mint a hostname under its domain, so the client addresses the ALB's own
+# name. Every prefix here is ours; there is deliberately no catch-all `/`.
+#
+# /runtime/ is NOT exposed: only in-cluster boxes fetch it, over the Service.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grok-bot-broker
+  namespace: grok-bot
+  annotations:
+    # An idle VNC viewer sends nothing for minutes; the gateway's SSE has its own
+    # 15s heartbeat but the desktop stream does not.
+    alb.ingress.kubernetes.io/idle-timeout: "3600"
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          # Prefix matching is per path *segment*, so the whole service name has to
+          # be spelled out: `/aiserver.` would never match
+          # `/aiserver.v1.GrokBotService/EnsureSandBox`.
+          - { path: /aiserver.v1.GrokBotService, pathType: Prefix, backend: { service: { name: grok-bot-broker, port: { number: 80 } } } }
+          - { path: /aiserver.v1.DashboardService, pathType: Prefix, backend: { service: { name: grok-bot-broker, port: { number: 80 } } } }
+          - { path: /box/, pathType: Prefix, backend: { service: { name: grok-bot-broker, port: { number: 80 } } } }
+          - { path: /broker/, pathType: Prefix, backend: { service: { name: grok-bot-broker, port: { number: 80 } } } }
+          - { path: /sand/, pathType: Prefix, backend: { service: { name: grok-bot-broker, port: { number: 80 } } } }
+          - { path: /sand-box/, pathType: Prefix, backend: { service: { name: grok-bot-broker, port: { number: 80 } } } }

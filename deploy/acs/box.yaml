@@ -1,0 +1,179 @@
+---
+# Grok Bot box runtime on Alibaba Cloud ACS.
+#
+# Only the box half of this repository is deployable: the Electron client stays
+# on the developer's machine and reaches this Pod through the gateway on 1340.
+# See deploy/acs/README.md for how the client is pointed at it.
+#
+# The image ships its own entrypoint (/usr/local/bin/start-sand-box) and a stock
+# host-main.cjs. Stage 1 runs that stock host to prove the chain; stage 2 swaps
+# in the reconstructed runtime built by `npm run build`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: grok-bot
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grok-bot-box
+  namespace: grok-bot
+spec:
+  replicas: 1
+  # The box holds per-session state on its volumes; never run two at once
+  # against the same claim.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: grok-bot-box }
+  template:
+    metadata:
+      labels: { app: grok-bot-box }
+    spec:
+      initContainers:
+        # The box image ships no agent CLI, and the reconstruction's Claude Code
+        # provider shells out to one (provider-session.ts:214 via
+        # resolveClaudeCodeCliPath). Install it into a shared volume so it
+        # survives restarts instead of being lost with the container filesystem.
+        # Reuses the box image purely because it is already on the node.
+        - name: install-agent-cli
+          image: public.ecr.aws/k0i0n2g5/cursorenvironments/universal:sand-box-latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -euo
+            - pipefail
+            - -c
+            - |
+              npm i -g --prefix /opt/agent-cli "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+              /opt/agent-cli/bin/claude --version
+          env:
+            # Pinned: an agent CLI that silently changes its control protocol
+            # would break the provider with no signal from this manifest.
+            - { name: CLAUDE_CODE_VERSION, value: 2.1.259 }
+          volumeMounts:
+            - { name: agent-cli, mountPath: /opt/agent-cli }
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+      containers:
+        - name: box
+          # Pulled straight from AWS public ECR: verified reachable from this
+          # cluster (1.40 GB, 60 s cold pull). No registry mirroring needed.
+          image: public.ecr.aws/k0i0n2g5/cursorenvironments/universal:sand-box-latest
+          imagePullPolicy: IfNotPresent
+          # No command/args: the image entrypoint boots the exec daemon,
+          # supervisor and host itself. Overriding it breaks the boot sequence.
+          env:
+            - { name: SAND_SUPERVISOR_ENABLED, value: "1" }
+            - { name: SAND_BOX_AUTO_UPDATE, value: "0" }
+            - { name: SAND_TREE_SITTER_NODE_DEPS, value: /home/box/deps }
+            - { name: NODE_PATH, value: /home/box/deps }
+            # Paired with the reconstructed daemon mounted below: tells the boot
+            # sequence not to lay down its own copy. Mirrors what local Docker
+            # mode passes (local-docker-host-connector.ts:192).
+            - { name: SAND_USE_EXISTING_BOX_EXEC_DAEMON, value: "1" }
+            # Binding off loopback makes the host require auth on its own
+            # (source/host/gateway-config.ts:49), so the token below is not
+            # belt-and-braces -- it is the only thing gating the gateway.
+            - { name: SAND_GATEWAY_BIND_HOST, value: 0.0.0.0 }
+            - { name: SAND_HOST_PORT, value: "1340" }
+            - name: SAND_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef: { name: grok-bot-box-gateway, key: token }
+            # --- Inference: BigModel over the Anthropic-compatible surface ---
+            # The router runs inside the box, so credentials have to be here.
+            # Env injection rather than mounting ~/.claude: no login state ever
+            # reaches this shared cluster.
+            #
+            # ANTHROPIC_API_KEY (not AUTH_TOKEN) on purpose -- it maps to the
+            # x-api-key header this endpoint was verified against, and it is
+            # also the variable the settings badge checks
+            # (inference-router-local.ts:54), so the UI agrees with reality.
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef: { name: grok-bot-inference, key: bigmodel-key }
+            # NOT api-gateway.glm.ai: that host does not resolve from this
+            # cluster. Verified reachable and returning 200 from a Pod here.
+            - { name: ANTHROPIC_BASE_URL, value: https://open.bigmodel.cn/api/anthropic }
+            - { name: ANTHROPIC_MODEL, value: glm-5.3 }
+            # resolveClaudeCodeCliPath() checks this before any well-known path,
+            # which is how the initContainer's install gets found.
+            - { name: CLAUDE_CODE_PATH, value: /opt/agent-cli/bin/claude }
+          ports:
+            - { name: gateway, containerPort: 1340 }
+            - { name: exec-daemon, containerPort: 1337 }
+            - { name: window-router, containerPort: 1339 }
+            - { name: novnc, containerPort: 6080 }
+          readinessProbe:
+            # /health wants the bearer token, so probe TCP rather than teach the
+            # kubelet the secret.
+            tcpSocket: { port: 1340 }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 36
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits: { cpu: "4", memory: 8Gi }
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+            - { name: sand-data, mountPath: /home/box/sand-data }
+            - { name: dshm, mountPath: /dev/shm }
+            - { name: agent-cli, mountPath: /opt/agent-cli, readOnly: true }
+            # The reconstruction proper, overlaid file-by-file onto the upstream
+            # image. subPath so the rest of /home/box/sand-host (workers,
+            # node_modules, extensions) still comes from the image.
+            - name: runtime
+              mountPath: /home/box/sand-host/host-main.cjs
+              subPath: sand-host/host-main.cjs
+              readOnly: true
+            - name: runtime
+              mountPath: /home/box/box-exec-daemon/main.cjs
+              subPath: box-exec-daemon/main.cjs
+              readOnly: true
+      volumes:
+        # emptyDir keeps this a throwaway environment. Swap for a PVC once the
+        # box is expected to survive a reschedule.
+        - { name: workspace, emptyDir: {} }
+        - { name: sand-data, emptyDir: {} }
+        - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 2Gi } }
+        - { name: agent-cli, emptyDir: {} }
+        # Seeded once by deploy/acs/seed-runtime.sh. A PVC rather than a derived
+        # image because Go-based registry clients cannot reach ACR from the
+        # build machine -- see README. RWO, so the seeder and the box must never
+        # run at the same time.
+        - name: runtime
+          persistentVolumeClaim:
+            claimName: grok-bot-runtime
+            readOnly: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grok-bot-box
+  namespace: grok-bot
+spec:
+  # ClusterIP only. The client reaches it with `kubectl port-forward`; the
+  # gateway token is not strong enough to want this on an ALB.
+  type: ClusterIP
+  selector: { app: grok-bot-box }
+  ports:
+    - { name: gateway, port: 1340, targetPort: 1340 }
+    # noVNC, for a human to take over the agent's desktop.
+    #
+    # UNAUTHENTICATED. Confirmed, not assumed: the websockify on 6080 runs
+    # `websockify 0.0.0.0:6080 localhost:5900` with no --token-plugin, and the
+    # x11vnc behind it runs -nopw. Anything that can reach this port gets an
+    # interactive root desktop. (6081 is the token-gated one, but it serves the
+    # fork sessions, not the primary display.)
+    #
+    # Deliberately ClusterIP and deliberately not an Ingress. This is only
+    # acceptable because the cluster is internal -- and note the cluster is
+    # shared with other workloads, so "internal" is not the same as "only me".
+    # Add a NetworkPolicy if you want that narrowed to specific peers.
+    - { name: novnc, port: 6080, targetPort: 6080 }
+    # The fork sessions' websockify. The host hands the client a loopback URL on
+    # this port (ensureForeverBox returns
+    # http://127.0.0.1:6081/vnc.html?path=websockify%3Ftoken%3D3), so the
+    # client-side proxy needs the port reachable by service name to make the
+    # agent's screen resolve. Token-gated per display, unlike 6080.
+    - { name: novnc-fork, port: 6081, targetPort: 6081 }

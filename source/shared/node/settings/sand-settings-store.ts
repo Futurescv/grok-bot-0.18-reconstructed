@@ -155,7 +155,11 @@ export class SandSettingsStore {
   getLocalToolPermissionChoice(): SandLocalToolPermission { return this.load().localToolPermission ?? SAND_DEFAULT_LOCAL_TOOL_PERMISSION; }
   getLocalToolPermissionCeiling(): SandLocalToolPermission | undefined { return this.load().localToolPermissionCeiling; }
   setLocalToolPermission(value: SandLocalToolPermission): void { this.update((s) => ({ ...s, localToolPermission: value })); }
-  getInferenceProvider(): SandInferenceProvider { return this.load().inferenceProvider ?? "cursor"; }
+  // The stored choice wins, but a deployment can set the default it boots with:
+  // a box whose settings live on an emptyDir loses settings.json on every
+  // restart, and silently falling back to Cursor there means turns fail against
+  // a backend the deployment never had credentials for.
+  getInferenceProvider(): SandInferenceProvider { const stored = this.load().inferenceProvider; if (stored != null) return stored; const configured = process.env.SAND_INFERENCE_PROVIDER?.trim(); return isSandInferenceProvider(configured) ? configured : "cursor"; }
   setInferenceProvider(value: SandInferenceProvider): void { this.update((s) => ({ ...s, inferenceProvider: value })); }
   getInferenceRouterUsage(): SandInferenceRouterUsage { return this.load().inferenceRouterUsage ?? emptySandInferenceRouterUsage(); }
   recordInferenceUsage(provider: SandInferenceProvider, usage: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }): void {

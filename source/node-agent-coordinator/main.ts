@@ -20,6 +20,7 @@ import { createWebAuthnProvider } from "./webauthn/provider.js";
 import { createSpawnedWebAuthnSigner, resolveWebAuthnSignerPath } from "./webauthn/signer.js";
 import { ClientSideToolV2Relay } from "./client-side-tool-v2-relay.js";
 import { createCoordinatorInferenceRouter } from "./inference-router.js";
+import { adoptRoutedProviderSecrets } from "../host/extensions/inference/routed-provider-secrets.js";
 
 export interface McpOAuthPending {
   readonly serverName: string;
@@ -241,6 +242,10 @@ export async function composeCoordinator(dependencies: ComposeCoordinatorDepende
     { post: (frame) => carrier.mainData.post(frame), close: () => carrier.mainData.close() },
     { dispatchRequest: (method, args, signal) => {
       if (method === "setGatewayPaused" && typeof args === "object" && args != null) applyPause((args as Record<string, unknown>).paused === true);
+      // Routed providers run in this process, so a key the user typed in
+      // Settings → Router has to be kept here too: on its own it would only ever
+      // reach the box, which never runs routed inference.
+      if (method === "setBoxSecrets") adoptRoutedProviderSecrets(args);
       return mainDispatch(method, args, signal);
     } }
   );

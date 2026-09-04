@@ -1,6 +1,6 @@
 import type { AgentDesktopBridge } from "../../../contracts/desktop-bridge";
 
-export type RouterProviderId = "cursor" | "claude-code" | "codex" | "openrouter";
+export type RouterProviderId = "cursor" | "claude-code" | "codex" | "openrouter" | "anthropic";
 
 export interface RouterProvider {
   readonly id: RouterProviderId;
@@ -40,6 +40,13 @@ export const ROUTER_PROVIDERS: readonly RouterProvider[] = [
     label: "OpenRouter",
     description: "Use models and billing from your OpenRouter account.",
     usageDescription: "OpenRouter usage and spend are managed in your OpenRouter account and are not exposed as an in-app meter.",
+    usageSource: "external"
+  },
+  {
+    id: "anthropic",
+    label: "Anthropic API",
+    description: "Use an Anthropic API key directly, or any Anthropic-compatible endpoint.",
+    usageDescription: "Anthropic API spend is managed by whoever issued the key and is not exposed as an in-app meter.",
     usageSource: "external"
   }
 ];

@@ -8,6 +8,8 @@
 #   node scripts/build-broker.mjs && ./deploy/acs/seed-runtime.sh
 #   kubectl -n grok-bot create secret generic grok-bot-broker-keys \
 #     --from-literal=master="$(python3 -c 'import secrets;print(secrets.token_urlsafe(48))')"
+#   kubectl -n grok-bot create configmap grok-bot-broker-endpoint \
+#     --from-literal=public-base-url=http://<your-ingress-host>
 #   kubectl apply -f deploy/acs/broker.yaml
 apiVersion: v1
 kind: ServiceAccount
@@ -79,9 +81,17 @@ spec:
             - { name: BOX_NAMESPACE, value: grok-bot }
             - { name: BROKER_MASTER_SECRET_FILE, value: /etc/broker/master }
             - { name: BROKER_RUNTIME_DIR, value: /opt/runtime-payload }
-            # Reached by the client; see deploy/acs/README.md on why this is HTTP
-            # for now and what has to change before wider distribution.
-            - { name: PUBLIC_BASE_URL, value: "http://alb-jpofuvio0969xihycr.cn-hongkong.alb.aliyuncsslbintl.com" }
+            # The address clients reach, and the one the broker rewrites box
+            # URLs to. It is deployment-specific and deliberately not in this
+            # repo: the endpoint is plain HTTP today (see deploy/acs/README.md
+            # for why, and what has to change before wider distribution), so
+            # publishing it would hand out a map to an untrusted surface.
+            # Create it once, before applying this file:
+            #   kubectl -n grok-bot create configmap grok-bot-broker-endpoint \
+            #     --from-literal=public-base-url=http://<your-ingress-host>
+            - name: PUBLIC_BASE_URL
+              valueFrom:
+                configMapKeyRef: { name: grok-bot-broker-endpoint, key: public-base-url }
             - { name: BOX_RUNTIME_BASE_URL, value: "http://grok-bot-broker.grok-bot.svc.cluster.local/runtime" }
             # A cold serverless start measured 2m20s for the 1.4GB image pull
             # alone, so the readiness budget has to clear that plus the box's boot.

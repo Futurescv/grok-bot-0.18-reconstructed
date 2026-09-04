@@ -1,4 +1,4 @@
-import { cp, mkdir, rm } from "node:fs/promises";
+import { cp, mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   outputApp,
@@ -44,6 +44,17 @@ await cp(builtAsarUnpacked, packagedUnpacked, {
 });
 
 const infoPlist = path.join(outputApp, "Contents", "Info.plist");
+// A build packaged against a self-hosted broker records it in Resources, so the
+// installed app needs nothing but the user's API key. Absent, the app keeps
+// talking to Cursor's backend exactly as before.
+// Usage: GROK_BOT_BROKER_URL=http://broker.example npm run package
+const brokerUrl = process.env.GROK_BOT_BROKER_URL?.trim();
+if (brokerUrl != null && brokerUrl.length > 0) {
+  new URL(brokerUrl);
+  const backendFile = path.join(resources, "sand-backend.json");
+  await writeFile(backendFile, `${JSON.stringify({ backendUrl: brokerUrl, authMode: "broker" }, null, 2)}\n`, "utf8");
+  process.stdout.write(`Packaged backend: ${brokerUrl}\n`);
+}
 await run(SYSTEM_TOOLS.plutil, ["-remove", "ElectronAsarIntegrity", infoPlist]);
 await run(SYSTEM_TOOLS.plutil, ["-replace", "CFBundleIdentifier", "-string", reconstructedBundleId, infoPlist]);
 await run(SYSTEM_TOOLS.plutil, ["-replace", "CFBundleDisplayName", "-string", reconstructedName, infoPlist]);

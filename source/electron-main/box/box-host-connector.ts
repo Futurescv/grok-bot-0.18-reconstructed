@@ -144,6 +144,13 @@ export class EnvDescriptorHostConnector {
     if (baseUrl == null || baseUrl.length === 0) throw new SandBoxHostConnectError(`${GATEWAY_URL_ENV} is not set`);
     return buildConnection(baseUrl, this.env[GATEWAY_TOKEN_ENV]?.trim() ?? "", this.env[GATEWAY_NETWORK_TOKEN_ENV]?.trim() ?? "");
   }
+  // The env-descriptor deployment has no Cursor backend to mint daemon
+  // credentials from — the desktop daemon reaches the configured gateway
+  // directly. Undefined matches how the brokered connector reports a missing
+  // credential, and the coordinator treats it as null. (The method must exist:
+  // the packaged coordinator gateway binding rejects connectors without it,
+  // which otherwise aborts the whole boot before a window opens.)
+  async issueLocalExecDaemonCredential(): Promise<undefined> { return undefined; }
 }
 
 export function createRemoteHostConnector(deps: BrokerDeps, env: NodeJS.ProcessEnv = process.env, updateSink?: { noteBackendUpdateRequirement(required: boolean): void }, descriptorFastPath?: { store: GatewayDescriptorStore; getAccountScope(): string | undefined }): SandRemoteHostConnector {

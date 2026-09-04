@@ -1,7 +1,19 @@
 import { createCursorAuthWiring, type AuthServicePort } from "../account/cursor-auth-wiring.js";
+import { resolveApiKeySessionConfig, SandApiKeySessionAuthService } from "../account/api-key-session.js";
+import { createBrokerSessionRuntime } from "../account/broker-session-runtime.js";
+import { createBrokerKeyPrompt, type BrokerKeyWindowElectron } from "../account/broker-key-window.js";
 import type { ElectronProductionAdapterBindings } from "../production-adapters.js";
 import type { ProductionAccountService, ProductionServiceContext } from "../main-production-services.js";
 import { requireFunction, requireObject } from "./provider-guards.js";
+
+// Electron's ipcMain/BrowserWindow are not on the narrow native-bindings port, and
+// this adapter only ever runs inside Electron; the lazy require mirrors
+// telemetry-report-sinks.ts.
+function requireElectronRuntime(): unknown {
+  const load = (() => { try { return eval("require") as NodeRequire; } catch { return undefined; } })();
+  if (load == null) throw new Error("Electron runtime is unavailable for the broker key window.");
+  return load("electron");
+}
 
 type CursorAuthWiringDeps = Parameters<typeof createCursorAuthWiring>[0];
 
@@ -28,8 +40,30 @@ function defaultWiringDeps(context: ProductionServiceContext): CursorAuthWiringD
   requireFunction(context.settings?.settingsStore?.setLocalToolPermissionCeiling, "account settings.setLocalToolPermissionCeiling");
   requireFunction(context.requireMainEdge, "account main-edge");
   requireFunction(context.coordinatorLegs?.legs?.setHostSettings, "account coordinator.setHostSettings");
+  // Self-hosted mode: the login gate accepts either an operator-run box's gateway
+  // token or, for builds packaged against a self-hosted broker, the user's own API
+  // key (see api-key-session.ts). Cursor account auth is untouched otherwise.
+  const broker = createBrokerSessionRuntime({
+    userDataDir: context.native.app.getPath("userData"),
+    safeStorage: context.native.safeStorage,
+  });
+  const apiKeySession = resolveApiKeySessionConfig(context.env, broker);
+  // Broker mode answers the renderer's existing "Sign in" button with a native key
+  // window, so the checksum-pinned renderer needs no change to collect a key.
+  const brokerKeyPrompt = apiKeySession?.mode !== "broker" || broker.backendUrl == null ? undefined : createBrokerKeyPrompt({
+    electron: requireElectronRuntime() as unknown as BrokerKeyWindowElectron,
+    preloadPath: context.resources.preloadPath,
+    backendUrl: broker.backendUrl,
+  });
   return {
     openExternal: async (url) => { await context.native.shell.openExternal(url); },
+    ...(apiKeySession == null ? {} : {
+      createAuthService: () => new SandApiKeySessionAuthService(apiKeySession, brokerKeyPrompt == null ? {} : {
+        promptForApiKey: brokerKeyPrompt,
+        storeApiKey: (apiKey) => broker.store.write(apiKey),
+        clearApiKey: () => broker.store.clear(),
+      }),
+    }),
     getAccountRuntime: () => accountRuntimeOf(context),
     emitAuthStatus: (status) => context.requireMainEdge().emit("cursor-auth-changed", status),
     sentryEnabled: context.env.SAND_DISABLE_SENTRY !== "1",

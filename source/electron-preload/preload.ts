@@ -1,3 +1,4 @@
+import { BROKER_KEY_SUBMIT_CHANNEL } from "../shared/broker-key-channel.js";
 import { CLIENT_PERSISTENCE_CHANNELS } from "../shared/persistence.js";
 import {
   createCoordinatorPortBroker,
@@ -310,6 +311,12 @@ export function installPrimaryPreload(options: {
   const desktop = createDesktopPreloadBridge({ ...options, env, devRestartEnabled, initialState });
   options.contextBridge.exposeInMainWorld("desktop", desktop);
   options.contextBridge.exposeInMainWorld("coordinatorPort", broker.bridge);
+  // Only the broker key window listens on this channel, and only while it is open
+  // (ipcMain.handleOnce). Exposing one submit function is cheaper than shipping a
+  // second preload just for that window.
+  options.contextBridge.exposeInMainWorld("sandBrokerKey", {
+    submit: (value: string | null) => options.ipc.invoke(BROKER_KEY_SUBMIT_CHANNEL, value),
+  });
   options.ipc.on("sand:coordinator-port", (event: { readonly ports: readonly any[] }) => {
     const port = event.ports[0];
     if (port != null) broker.deliver(wrapTransferredCoordinatorPort(port));

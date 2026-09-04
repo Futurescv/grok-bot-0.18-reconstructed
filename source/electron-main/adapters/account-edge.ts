@@ -1,4 +1,6 @@
 import { fetchSandAccess } from "../account/access.js";
+import { apiKeySessionSandAccess, resolveApiKeySessionConfig } from "../account/api-key-session.js";
+import { createBrokerSessionRuntime } from "../account/broker-session-runtime.js";
 import { createCursorAccountEdgePort, createTranscriptionManagerEnsure, type AccountRuntime } from "../account/cursor-auth-wiring.js";
 import { resolveCursorAvatarDataUrl } from "../account/cursor-avatar.js";
 import {
@@ -38,14 +40,23 @@ export function createElectronProductionCursorAccountBinding(): ElectronProducti
   return {
     create(context) {
       const getMachineId = machineId(context);
+      // In API-key (self-hosted) mode the operator running the box is the
+      // entitlement authority; grant locally rather than asking the Cursor
+      // backend, which would 401 and leave the client in "checking" forever.
+      const apiKeySession = resolveApiKeySessionConfig(context.env, createBrokerSessionRuntime({
+        userDataDir: context.native.app.getPath("userData"),
+        safeStorage: context.native.safeStorage,
+      }));
       return createCursorAccountEdgePort({
         ensureCursorAuthService: () => context.requireAccount().getAuthService(),
         currentAuthStatusFreshness: () => context.requireAccount().currentAuthStatusFreshness(),
         getAccountRuntime: () => accountRuntimeOf(context),
-        readSandAccess: (getAccessToken) => fetchSandAccess(getAccessToken, {
-          createClient: (credentials) => createSandCursorBackendClient(DashboardService, credentials) as unknown as SandAccessBackend,
-          getMachineId,
-        }),
+        readSandAccess: apiKeySession == null
+          ? (getAccessToken) => fetchSandAccess(getAccessToken, {
+            createClient: (credentials) => createSandCursorBackendClient(DashboardService, credentials) as unknown as SandAccessBackend,
+            getMachineId,
+          })
+          : apiKeySessionSandAccess,
         resetMcpManager: () => context.requireMcp().resetMcpManager(),
         refreshHostMcp: () => context.requireMcp().refreshHostMcp(),
         resolveAvatar: (authId, preferredUrl) => resolveCursorAvatarDataUrl(authId, { ...(preferredUrl == null ? {} : { preferredUrl }) }),

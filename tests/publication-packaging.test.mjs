@@ -101,7 +101,13 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(cursorSession, /createProviderPromptSession\(routedProvider\)/);
   assert.match(cursorBackend, /routedProvider !== "cursor"/);
   assert.match(cursorBackend, /createProviderPromptSession\(routedProvider\)/);
-  assert.doesNotMatch(rendererPatch, /ANTHROPIC_API_KEY|OPENAI_API_KEY/);
+  // The Router UI may collect a key for the dedicated Anthropic API provider,
+  // but only under a Grok Bot-namespaced name: a bare ANTHROPIC_API_KEY would
+  // collide with the Claude Code CLI's own deployment contract, and the
+  // claude-code/codex rows deliberately reuse existing local sign-ins rather
+  // than asking for a vendor key at all.
+  assert.match(rendererPatch, /secret:"GROKBOT_ANTHROPIC_API_KEY"/);
+  assert.doesNotMatch(rendererPatch, /secret:"ANTHROPIC_API_KEY"|OPENAI_API_KEY/);
   assert.match(turnShell, /inferenceProvider === "cursor"/);
   assert.match(turnShell, /createProviderPromptSession\(inferenceProvider\)/);
   assert.match(coordinator, /method !== "sendPrompt" \|\| provider === "cursor"/);
